@@ -1,0 +1,25 @@
+# Copy to .github/workflows/watchpo.yml in YOUR product's repo.
+# Needs a repository secret named ANTHROPIC_API_KEY.
+name: watchpo
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"   # Mondays 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: saintlee83/watchpo@main
+        with:
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # A fixed window that matches the schedule. Already-analyzed changes are
+          # skipped via cached state, and if the cache expires the window still
+          # bounds what gets re-analyzed.
+          args: --issue --since 8d

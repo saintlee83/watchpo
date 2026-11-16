@@ -1,0 +1,57 @@
+name: watchpo
+description: Track upstream open-source changes and get Claude's suggestions for improving your product.
+branding:
+  icon: eye
+  color: purple
+
+inputs:
+  anthropic-api-key:
+    description: Claude API key (store it as a repository secret).
+    required: true
+  github-token:
+    description: Token for reading upstream repos and opening the digest issue.
+    default: ${{ github.token }}
+  working-directory:
+    description: Directory containing watchpo.yml.
+    default: "."
+  args:
+    description: Arguments for `watchpo run`.
+    default: "--issue"
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v6
+
+    - name: Restore watchpo state
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ inputs.working-directory }}/.watchpo/state.json
+        key: watchpo-state-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: watchpo-state-
+
+    - name: Run watchpo
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        WATCHPO_SRC: ${{ github.action_path }}
+        WATCHPO_ARGS: ${{ inputs.args }}
+      # WATCHPO_ARGS is intentionally unquoted so it splits into separate flags.
+      run: uvx --from "$WATCHPO_SRC" watchpo run $WATCHPO_ARGS
+
+    - name: Save watchpo state
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ inputs.working-directory }}/.watchpo/state.json
+        key: watchpo-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+    - name: Upload report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: watchpo-report-${{ github.run_id }}
+        path: ${{ inputs.working-directory }}/.watchpo/reports/
+        if-no-files-found: ignore
