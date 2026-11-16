@@ -1,0 +1,30 @@
+[project]
+name = "watchpo"
+version = "0.1.0"
+description = "An AI watchdog that tracks upstream open-source changes and suggests improvements to your product."
+readme = "README.md"
+authors = [
+    { name = "saintlee83", email = "heisasaint83@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=2.8.0",
+    "httpx2>=2.16",
+    "pydantic>=2.10",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+watchpo = "watchpo:main"
+
+[build-system]
+requires = ["uv_build>=0.9.11,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

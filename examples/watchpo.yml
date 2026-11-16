@@ -1,0 +1,38 @@
+# Example: a FastAPI-based SaaS backend learning from its ecosystem.
+product:
+  name: acme-api
+  description: |
+    Multi-tenant REST API for scheduling field-service jobs. Python 3.12, FastAPI,
+    SQLAlchemy 2 on Postgres, Celery for background work, deployed on Kubernetes.
+    ~40 engineers; we care most about p95 latency, safe migrations, and a clean
+    public API that customers integrate against.
+  path: .
+  focus: [performance, reliability, API design, security]
+
+watch:
+  - repo: fastapi/fastapi
+    why: Our web framework. Catch new features, deprecations, and security fixes early.
+    track: [releases, pulls]
+    exclude_labels: [docs, translations]
+  - repo: sqlalchemy/sqlalchemy
+    why: ORM we depend on. Look for performance improvements and API changes.
+    track: [releases]
+  - repo: litestar-org/litestar
+    why: A competing framework. Ideas for API ergonomics and performance we could adopt.
+    track: [releases, pulls]
+  - repo: celery/celery
+    why: Background jobs. Reliability fixes that may hit us too.
+    track: [releases, pulls]
+    include_labels: [bug]
+
+settings:
+  lookback_days: 14
+  max_items_per_repo: 50
+
+claude:
+  model: claude-opus-5-5
+  effort: high
+
+report:
+  issue_repo: acme/acme-api
+  issue_labels: [watchpo, upstream]
