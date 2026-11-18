@@ -93,21 +93,24 @@ class GitHub:
             return r
         raise GitHubError(f"GET {url}: retries exhausted")
 
-    def _paginate(self, url: str, params: dict[str, Any], max_pages: int = 10) -> Iterator[dict]:
+    def _paginate(self, url: str, params: dict[str, Any], max_pages: int | None = None) -> Iterator[dict]:
         page_url: str | None = url
         page_params: dict[str, Any] | None = {**params, "per_page": 100}
-        for _ in range(max_pages):
-            if page_url is None:
-                return
+        pages = 0
+        while page_url and (max_pages is None or pages < max_pages):
+            pages += 1
             r = self._get(page_url, page_params)
             yield from r.json()
             page_url = r.links.get("next", {}).get("url")
             page_params = None  # the next link already carries the query
 
     def create_issue(self, repo: str, title: str, body: str, labels: list[str]) -> str:
-        r = self._http.post(
-            f"/repos/{repo}/issues", json={"title": title, "body": body, "labels": labels}
-        )
+        try:
+            r = self._http.post(
+                f"/repos/{repo}/issues", json={"title": title, "body": body, "labels": labels}
+            )
+        except httpx2.TransportError as e:
+            raise GitHubError(f"creating issue in {repo}: {e}") from e
         if r.status_code >= 400:
             raise GitHubError(f"creating issue in {repo} -> {r.status_code}: {r.text[:300]}")
         return r.json()["html_url"]
@@ -116,7 +119,7 @@ class GitHub:
 
     def releases(self, repo: str, since: datetime) -> list[ChangeItem]:
         items = []
-        for rel in self._paginate(f"/repos/{repo}/releases", {}, max_pages=3):
+        for rel in self._paginate(f"/repos/{repo}/releases", {}):
             if rel.get("draft"):
                 continue
             published = rel.get("published_at") or rel.get("created_at")
@@ -145,7 +148,7 @@ class GitHub:
     def merged_pulls(self, w: WatchedRepo, since: datetime) -> list[ChangeItem]:
         items = []
         params = {"state": "closed", "sort": "updated", "direction": "desc"}
-        for pr in self._paginate(f"/repos/{w.repo}/pulls", params, max_pages=10):
+        for pr in self._paginate(f"/repos/{w.repo}/pulls", params):
             if parse_dt(pr["updated_at"]) < since:
                 break  # sorted by updated desc; nothing older can have merged later
             merged = pr.get("merged_at")
@@ -177,7 +180,7 @@ class GitHub:
                 params["sha"] = w.branch
             if path:
                 params["path"] = path
-            for c in self._paginate(f"/repos/{w.repo}/commits", params, max_pages=5):
+            for c in self._paginate(f"/repos/{w.repo}/commits", params):
                 sha = c["sha"]
                 msg = c["commit"]["message"]
                 title, _, rest = msg.partition("\n")
@@ -196,7 +199,7 @@ class GitHub:
         return list(found.values())
 
     def changes(
-        self, w: WatchedRepo, since: datetime, settings: Settings, seen: set[str]
+        self, w: WatchedRepo, since: datetime, settings: Settings, seen: set[str], *, limit: bool = True
     ) -> list[ChangeItem]:
         items: list[ChangeItem] = []
         if "releases" in w.track:
@@ -205,7 +208,7 @@ class GitHub:
             items += self.merged_pulls(w, since)
         if "commits" in w.track:
             items += self.commits(w, since)
-        return filter_items(items, w, settings, seen)
+        return filter_items(items, w, settings, seen, limit=limit)
 
     # -- details for the deep-dive tool ----------------------------------
 
@@ -234,7 +237,7 @@ class GitHub:
 
 
 def filter_items(
-    items: list[ChangeItem], w: WatchedRepo, settings: Settings, seen: set[str]
+    items: list[ChangeItem], w: WatchedRepo, settings: Settings, seen: set[str], *, limit: bool = True
 ) -> list[ChangeItem]:
     bots = {a.lower() for a in settings.exclude_authors}
     inc = {lbl.lower() for lbl in w.include_labels}
@@ -254,7 +257,7 @@ def filter_items(
         out.append(it)
     # Releases first (they summarize many changes), then newest first.
     out.sort(key=lambda i: (i.kind != "release", -i.date.timestamp()))
-    return out[: settings.max_items_per_repo]
+    return out[: settings.max_items_per_repo] if limit else out
 
 
 def render_files(files: list[dict]) -> str:

@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from .analyzer import estimate_cost
+from .branches import branch_name, has_edits
+from .state import atomic_write
 from .models import ChangeItem, RepoReport, RunReport, Suggestion, Usage
 
 ISSUE_LIMIT = 65_000  # GitHub caps issue bodies at 65,536 chars
@@ -47,7 +49,7 @@ def render_markdown(run: RunReport, compact: bool = False) -> str:
     n_items = sum(len(r.items) for r in run.repos)
     all_sugs = [(rr, s) for rr in run.repos for s in ordered(rr)]
     u = total_usage(run)
-    cost = estimate_cost(run.model, u)
+    cost = estimate_cost(run.model, u) if run.provider == "anthropic" else None
 
     lines = [f"# watchpo digest: {run.product} ({date})", ""]
     stats = [
@@ -79,7 +81,7 @@ def render_markdown(run: RunReport, compact: bool = False) -> str:
                 f"| {numbers[id(s)]} | {_cell(s.title)} | {rr.repo} | {s.impact} | {s.effort} | {s.confidence} |"
             )
         lines.append("")
-    elif n_items:
+    elif n_items and all(not r.error for r in run.repos):
         lines += ["No actionable suggestions this time. See the per-repo summaries below.", ""]
 
     for rr in run.repos:
@@ -89,16 +91,22 @@ def render_markdown(run: RunReport, compact: bool = False) -> str:
         if rr.why:
             meta = f"Why we watch it: {rr.why} · " + meta
         lines += [f"_{meta}_", ""]
+        if rr.deferred:
+            lines += [f"{rr.deferred} additional change(s) queued for a later batch.", ""]
+        if has_edits(rr) and run.base_commit:
+            lines += [f"Local target branch: `{branch_name(run, rr)}` (base `{run.base_commit[:12]}`).", ""]
         if rr.error:
-            lines += [f"> ⚠️ Analysis failed: {rr.error}", ""]
+            lines += [f"> ⚠️ {rr.error}", ""]
         if not rr.items:
-            lines += ["Nothing new.", ""]
+            if not rr.error:
+                lines += ["Nothing new.", ""]
             continue
         if rr.result is None:
             continue
         lines += [rr.result.summary.strip(), ""]
         if rr.served_by and rr.served_by != run.model:
-            lines += [f"_Served by fallback model `{rr.served_by}`._", ""]
+            label = "fallback model" if run.provider == "anthropic" else "model"
+            lines += [f"_Served by {label} `{rr.served_by}`._", ""]
         for s in ordered(rr):
             lines += [
                 f"### {numbers.get(id(s), '•')}. {s.title}",
@@ -146,12 +154,16 @@ def issue_body(run: RunReport) -> str:
     return body[: ISSUE_LIMIT - 200] + "\n\n…[truncated to fit GitHub's issue size limit; see the full report artifact]\n"
 
 
+def report_paths(run: RunReport, out_dir: Path) -> tuple[Path, Path]:
+    stamp = f"{run.started_at:%Y-%m-%d-%H%M%S}-{run.run_id.hex}"
+    return out_dir / f"{stamp}.md", out_dir / f"{stamp}.json"
+
+
 def write_reports(run: RunReport, out_dir: Path) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = run.started_at.strftime("%Y-%m-%d-%H%M")
-    md = out_dir / f"{stamp}.md"
-    js = out_dir / f"{stamp}.json"
-    md.write_text(render_markdown(run))
-    js.write_text(run.model_dump_json(indent=2))
-    (out_dir / "latest.md").write_text(md.read_text())
+    md, js = report_paths(run, out_dir)
+    markdown = render_markdown(run)
+    atomic_write(js, run.model_dump_json(indent=2))
+    atomic_write(md, markdown)
+    atomic_write(out_dir / "latest.md", markdown)
     return md, js

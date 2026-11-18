@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import AliasChoices, BaseModel, Field, ValidationError, field_validator, model_validator
 
 CONFIG_NAMES = ("watchpo.yml", "watchpo.yaml", ".watchpo.yml")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -56,8 +56,8 @@ class WatchedRepo(BaseModel):
 
 
 class Settings(BaseModel):
-    lookback_days: int = 14
-    max_items_per_repo: int = 50
+    lookback_days: int = Field(default=14, ge=1)
+    max_items_per_repo: int = Field(default=50, ge=1)
     exclude_authors: list[str] = Field(
         default_factory=lambda: [
             "dependabot[bot]",
@@ -68,15 +68,40 @@ class Settings(BaseModel):
     )
 
 
-class ClaudeSettings(BaseModel):
+class AISettings(BaseModel):
+    provider: Literal["anthropic", "openai-compatible"] = "anthropic"
+    base_url: str = "http://127.0.0.1:11434/v1"
+    api_key_env: str | None = None
     model: str = "claude-opus-5-5"
     effort: Literal["low", "medium", "high", "xhigh", "max"] = "high"
-    max_turns: int = 30
+    max_turns: int = Field(default=30, ge=1)
     # Server-side refusal fallbacks: "default" lets the API pick a substitute
     # model if the request is declined by a safety classifier; "off" disables.
     fallbacks: Literal["default", "off"] = "default"
-    # Let Claude read and search your codebase so suggestions name real files.
+    # Let the model inspect files while checking recommendations.
     explore_codebase: bool = True
+
+    @field_validator("fallbacks", mode="before")
+    @classmethod
+    def _yaml_off(cls, value: object) -> object:
+        return "off" if value is False else value
+
+    @model_validator(mode="after")
+    def _compatible_model(self) -> "AISettings":
+        if self.provider == "openai-compatible":
+            if "model" not in self.model_fields_set or not self.model.strip():
+                raise ValueError("ai.model must name a model served by the configured endpoint")
+            if not self.base_url.startswith(("http://", "https://")):
+                raise ValueError("ai.base_url must be an HTTP(S) API base URL")
+        return self
+
+
+ClaudeSettings = AISettings  # existing Python callers
+
+
+class WorkflowSettings(BaseModel):
+    interval_seconds: int = Field(default=900, ge=1)
+    mode: Literal["report", "branch"] = "report"
 
 
 class ReportSettings(BaseModel):
@@ -89,7 +114,8 @@ class Config(BaseModel):
     product: Product
     watch: list[WatchedRepo] = Field(default_factory=list)
     settings: Settings = Field(default_factory=Settings)
-    claude: ClaudeSettings = Field(default_factory=ClaudeSettings)
+    ai: AISettings = Field(default_factory=AISettings, validation_alias=AliasChoices("ai", "claude"))
+    workflow: WorkflowSettings = Field(default_factory=WorkflowSettings)
     report: ReportSettings = Field(default_factory=ReportSettings)
     state_file: str = ".watchpo/state.json"
 
@@ -104,6 +130,10 @@ class Config(BaseModel):
     @property
     def root(self) -> Path:
         return self._root
+
+    @property
+    def claude(self) -> AISettings:
+        return self.ai
 
     def resolve(self, rel: str) -> Path:
         p = Path(rel).expanduser()
@@ -139,6 +169,8 @@ def load_config(path: Path | None = None) -> tuple[Config, Path]:
         raise ConfigError("No watchpo.yml found. Run `watchpo init` first.")
     try:
         raw = yaml.safe_load(cfg_path.read_text()) or {}
+    except OSError as e:
+        raise ConfigError(f"{cfg_path}: {e.strerror}") from e
     except yaml.YAMLError as e:
         raise ConfigError(f"{cfg_path}: invalid YAML: {e}") from e
     try:
@@ -167,11 +199,11 @@ TEMPLATE = """\
 
 product:
   name: {name}
-  # Tell Claude what your product is, who uses it, and what you care about.
+  # Describe what your product is, who uses it, and what you care about.
   # The better this is, the more relevant the suggestions.
   description: |
     {description}
-  path: .          # your product's codebase (Claude reads it to ground suggestions)
+  path: .          # local product checkout
   focus: []        # optional, e.g. [performance, security, developer experience]
 
 # Open-source repos to learn from: dependencies, competitors, or inspiration.
@@ -183,12 +215,17 @@ settings:
   max_items_per_repo: 50   # most recent N changes per repo are analyzed
   exclude_authors: ["dependabot[bot]", "renovate[bot]", "github-actions[bot]", "pre-commit-ci[bot]"]
 
-claude:
+workflow:
+  interval_seconds: 900
+  mode: report            # branch creates local commits for concrete edits
+
+ai:
+  provider: anthropic      # or openai-compatible with model and base_url
   model: claude-opus-5-5
   effort: high             # low | medium | high | xhigh | max
   max_turns: 30            # tool-use turns per repo
   fallbacks: default       # retry on a substitute model if a request is declined; "off" to disable
-  explore_codebase: true   # let Claude read/search your code (read-only, git-tracked files only)
+  explore_codebase: true   # enable file reads and search for the selected model
 
 report:
   dir: .watchpo/reports

@@ -1,13 +1,13 @@
 name: watchpo
-description: Track upstream open-source changes and get Claude's suggestions for improving your product.
+description: Track upstream changes and analyze them with the AI configured in your project.
 branding:
   icon: eye
   color: purple
 
 inputs:
   anthropic-api-key:
-    description: Claude API key (store it as a repository secret).
-    required: true
+    description: Anthropic API key when using the Anthropic provider.
+    required: false
   github-token:
     description: Token for reading upstream repos and opening the digest issue.
     default: ${{ github.token }}
@@ -15,7 +15,7 @@ inputs:
     description: Directory containing watchpo.yml.
     default: "."
   args:
-    description: Arguments for `watchpo run`.
+    description: Arguments for watchpo run.
     default: "--issue"
 
 runs:
@@ -23,35 +23,51 @@ runs:
   steps:
     - uses: astral-sh/setup-uv@v6
 
-    - name: Restore watchpo state
-      uses: actions/cache/restore@v4
-      with:
-        path: ${{ inputs.working-directory }}/.watchpo/state.json
-        key: watchpo-state-${{ github.run_id }}-${{ github.run_attempt }}
-        restore-keys: watchpo-state-
-
-    - name: Run watchpo
+    - name: Resolve project state
+      id: paths
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
-        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        WATCHPO_SRC: ${{ github.action_path }}
+      run: |
+        state=$(uvx --from "$WATCHPO_SRC" watchpo path state)
+        scope=$(printf '%s' "${state#"$GITHUB_WORKSPACE"/}" | git hash-object --stdin | cut -c1-16)
+        echo "state=$state" >> "$GITHUB_OUTPUT"
+        echo "scope=$scope" >> "$GITHUB_OUTPUT"
+
+    - name: Restore watchpo state
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.paths.outputs.state }}
+        key: watchpo-state-${{ steps.paths.outputs.scope }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: watchpo-state-${{ steps.paths.outputs.scope }}-
+
+    - name: Run watchpo
+      id: analyze
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key || env.ANTHROPIC_API_KEY }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         WATCHPO_SRC: ${{ github.action_path }}
         WATCHPO_ARGS: ${{ inputs.args }}
-      # WATCHPO_ARGS is intentionally unquoted so it splits into separate flags.
-      run: uvx --from "$WATCHPO_SRC" watchpo run $WATCHPO_ARGS
+      run: |
+        set -f
+        uvx --from "$WATCHPO_SRC" watchpo run $WATCHPO_ARGS
 
     - name: Save watchpo state
-      if: always()
+      if: always() && steps.paths.outcome == 'success'
       uses: actions/cache/save@v4
       with:
-        path: ${{ inputs.working-directory }}/.watchpo/state.json
-        key: watchpo-state-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ steps.paths.outputs.state }}
+        key: watchpo-state-${{ steps.paths.outputs.scope }}-${{ github.run_id }}-${{ github.run_attempt }}
 
     - name: Upload report
-      if: always()
+      if: always() && steps.analyze.outputs.report_json != ''
       uses: actions/upload-artifact@v4
       with:
         name: watchpo-report-${{ github.run_id }}
-        path: ${{ inputs.working-directory }}/.watchpo/reports/
-        if-no-files-found: ignore
+        include-hidden-files: true
+        path: |
+          ${{ steps.analyze.outputs.report_md }}
+          ${{ steps.analyze.outputs.report_json }}

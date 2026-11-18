@@ -29,7 +29,12 @@ settings:
   lookback_days: 14
   max_items_per_repo: 50
 
-claude:
+workflow:
+  interval_seconds: 900
+  mode: report           # branch also prepares local review commits
+
+ai:
+  provider: anthropic    # for a local model, see the README's Chat Completions example
   model: claude-opus-5-5
   effort: high
 

@@ -8,14 +8,17 @@ own code, and finishes by calling `submit_analysis` with structured suggestions.
 from __future__ import annotations
 
 import sys
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import anthropic
 from pydantic import BaseModel, ValidationError
 
-from .config import ClaudeSettings, WatchedRepo
+from .branches import BranchError, git_location, plan_edits
+from .config import AISettings, WatchedRepo
 from .github import GitHub, GitHubError
-from .models import AnalysisResult, ChangeItem, Usage
+from .models import AnalysisResult, ChangeItem, Edit, Usage
 from .profile import Codebase
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
@@ -255,17 +258,32 @@ def echo_blocks(content: list[Any]) -> tuple[list[dict], list[Any]]:
     return echoed, calls
 
 
-class Analyzer:
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    input: Any
+
+
+@dataclass
+class Turn:
+    assistant: dict
+    calls: list[ToolCall]
+    stop_reason: str | None
+    usage: Usage
+    model: str
+
+
+class ToolAnalyzer:
     def __init__(
         self,
-        client: anthropic.Anthropic,
-        settings: ClaudeSettings,
+        settings: AISettings,
         profile: str,
         github: GitHub,
         code: Codebase | None,
         log: Callable[[str], None] | None = None,
+        *, base_commit: str | None = None,
     ):
-        self.client = client
         self.s = settings
         self.github = github
         self.code = code if settings.explore_codebase else None
@@ -278,34 +296,22 @@ class Analyzer:
                 "cache_control": {"type": "ephemeral"},
             }
         ]
-        self.tools = [UPSTREAM_TOOL, *(CODE_TOOLS if self.code else []), SUBMIT_TOOL]
+        self.base_commit = base_commit
+        submit = SUBMIT_TOOL
+        if base_commit:
+            submit = deepcopy(SUBMIT_TOOL)
+            props = submit["input_schema"]["properties"]["suggestions"]["items"]["properties"]
+            props["edits"] = {"type": "array", "items": Edit.model_json_schema()}
+            self.system[0]["text"] += (
+                "\nFor concrete suggestions, read each target file and include edits. Each edit "
+                "replaces one unique, exact before string with after in an existing product file. "
+                "Use product-relative paths listed in affected_files. Omit edits for ideas that "
+                "need human decisions. Only propose changes supported by an upstream reference."
+            )
+        self.tools = [UPSTREAM_TOOL, *(CODE_TOOLS if self.code else []), submit]
 
-    def _request(self, messages: list[dict]) -> Any:
-        kwargs: dict[str, Any] = dict(
-            model=self.s.model,
-            max_tokens=MAX_TOKENS,
-            system=self.system,
-            tools=self.tools,
-            messages=messages,
-            thinking={"type": "adaptive"},
-            output_config={"effort": self.s.effort},
-            cache_control={"type": "ephemeral"},
-        )
-        if self.s.fallbacks == "default":
-            kwargs["betas"] = [FALLBACK_BETA]
-            kwargs["fallbacks"] = "default"
-        for attempt in range(3):
-            try:
-                with self.client.beta.messages.stream(**kwargs) as stream:
-                    return stream.get_final_message()
-            except anthropic.APIError:
-                raise
-            except ValueError as e:
-                # Eager input streaming: tool input JSON the SDK couldn't parse.
-                if attempt == 2:
-                    raise AnalysisError(f"model produced unparseable tool input: {e}") from e
-                self.log("  (retrying: malformed tool input)")
-        raise AssertionError("unreachable")
+    def _request(self, messages: list[dict]) -> Turn:
+        raise NotImplementedError
 
     def analyze(self, repo: WatchedRepo, items: list[ChangeItem]) -> tuple[AnalysisResult, Usage, str]:
         usage = Usage()
@@ -322,22 +328,11 @@ class Analyzer:
 
         for turn in range(1, self.s.max_turns + 1):
             msg = self._request(messages)
-            u = msg.usage
-            usage.add(
-                Usage(
-                    input_tokens=u.input_tokens,
-                    output_tokens=u.output_tokens,
-                    cache_read_input_tokens=u.cache_read_input_tokens or 0,
-                    cache_creation_input_tokens=u.cache_creation_input_tokens or 0,
-                    requests=1,
-                )
-            )
+            usage.add(msg.usage)
             if msg.stop_reason == "refusal":
-                cat = getattr(msg.stop_details, "category", None) if msg.stop_details else None
-                raise AnalysisError(f"request declined by the model (category: {cat or 'unknown'})")
-
-            echoed, calls = echo_blocks(msg.content)
-            messages.append({"role": "assistant", "content": echoed})
+                raise AnalysisError("request declined by the model")
+            calls = msg.calls
+            messages.append(msg.assistant)
 
             if msg.stop_reason == "max_tokens":
                 results = [
@@ -360,8 +355,8 @@ class Analyzer:
             for call in calls:
                 if call.name == "submit_analysis":
                     try:
-                        result = AnalysisResult.model_validate(call.input)
-                    except ValidationError as e:
+                        result = self._submission(call.input, by_id)
+                    except (ValueError, BranchError) as e:
                         results.append(_result(call.id, f"Invalid submission, fix and resubmit:\n{e}", error=True))
                         continue
                     self.log(f"  ✓ {len(result.suggestions)} suggestion(s) after {turn} turn(s)")
@@ -373,6 +368,22 @@ class Analyzer:
             messages.append({"role": "user", "content": results})
 
         raise AnalysisError(f"no submission within {self.s.max_turns} turns")
+
+    def _submission(self, raw: Any, items: dict[str, ChangeItem]) -> AnalysisResult:
+        result = AnalysisResult.model_validate(raw)
+        refs = {note.ref for note in result.also_noted}
+        for suggestion in result.suggestions:
+            if not suggestion.upstream_refs:
+                raise ValueError("Each suggestion needs an upstream reference.")
+            refs.update(suggestion.upstream_refs)
+        if unknown := refs - items.keys():
+            raise ValueError(f"Unknown upstream references: {', '.join(sorted(unknown))}")
+        if any(s.edits for s in result.suggestions):
+            if not self.base_commit or not self.code:
+                raise ValueError("Edits require branch mode.")
+            top, prefix = git_location(self.code.root)
+            plan_edits(top, prefix, self.base_commit, result)
+        return result
 
     def _run_tool(self, call: Any, by_id: dict[str, ChangeItem]) -> dict:
         name, raw = call.name, call.input
@@ -402,6 +413,47 @@ class Analyzer:
             return _result(call.id, f"INVALID_INPUT: {e}", error=True)
         except GitHubError as e:
             return _result(call.id, f"GitHub error: {e}", error=True)
+
+
+class Analyzer(ToolAnalyzer):
+    def __init__(self, client: anthropic.Anthropic, settings: AISettings, profile: str,
+                 github: GitHub, code: Codebase | None, log=None, *, base_commit: str | None = None):
+        super().__init__(settings, profile, github, code, log, base_commit=base_commit)
+        self.client = client
+
+    def _request(self, messages: list[dict]) -> Turn:
+        kwargs: dict[str, Any] = dict(
+            model=self.s.model,
+            max_tokens=MAX_TOKENS,
+            system=self.system,
+            tools=self.tools,
+            messages=messages,
+            thinking={"type": "adaptive"},
+            output_config={"effort": self.s.effort},
+            cache_control={"type": "ephemeral"},
+        )
+        if self.s.fallbacks == "default":
+            kwargs["betas"] = [FALLBACK_BETA]
+            kwargs["fallbacks"] = "default"
+        for attempt in range(3):
+            try:
+                with self.client.beta.messages.stream(**kwargs) as stream:
+                    msg = stream.get_final_message()
+                echoed, calls = echo_blocks(msg.content)
+                u = msg.usage
+                usage = Usage(input_tokens=u.input_tokens, output_tokens=u.output_tokens, requests=1,
+                              cache_read_input_tokens=u.cache_read_input_tokens or 0,
+                              cache_creation_input_tokens=u.cache_creation_input_tokens or 0)
+                return Turn({"role": "assistant", "content": echoed},
+                            [ToolCall(c.id, c.name, c.input) for c in calls], msg.stop_reason, usage, msg.model)
+            except anthropic.APIError:
+                raise
+            except ValueError as e:
+                # Eager input streaming: tool input JSON the SDK couldn't parse.
+                if attempt == 2:
+                    raise AnalysisError(f"model produced unparseable tool input: {e}") from e
+                self.log("  (retrying: malformed tool input)")
+        raise AssertionError("unreachable")
 
 
 def _result(tool_use_id: str, content: str, error: bool = False) -> dict:

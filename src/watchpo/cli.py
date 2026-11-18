@@ -7,9 +7,15 @@ import os
 import re
 import subprocess
 import sys
+import signal
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
+from filelock import FileLock, Timeout
+
 from . import __version__
+from .branches import BranchError, apply_report
 from .config import (
     CONFIG_NAMES,
     Config,
@@ -22,7 +28,9 @@ from .config import (
 )
 from .github import GitHub, GitHubError, resolve_token
 from .profile import Codebase, build_profile
-from .report import issue_body, write_reports
+from .models import RunReport
+from .report import issue_body, report_paths
+from .state import load_state, save_state
 from .runner import RunOptions, parse_since, run
 
 
@@ -114,18 +122,22 @@ def cmd_remove(args: argparse.Namespace) -> int:
 
 def cmd_list(args: argparse.Namespace) -> int:
     cfg, path = _load(args)
-    from .state import load_state
 
-    state = load_state(cfg.resolve(cfg.state_file))
+    state = load_state(cfg.resolve(cfg.state_file), repair=False)
     print(f"{cfg.product.name}  ({path})")
     if not cfg.watch:
         print("  (not watching any repos yet; `watchpo add owner/name`)")
     for w in cfg.watch:
-        last = state.get(w.repo).last_run
+        checkpoint = state.get(w.repo)
+        last = checkpoint.last_run
         when = last.strftime("%Y-%m-%d %H:%M UTC") if last else "never"
-        print(f"  {w.repo:<40} {','.join(w.track):<24} last run: {when}")
+        print(f"  {w.repo:<40} {','.join(w.track):<24} last fetch: {when}")
+        if pending := checkpoint.pending:
+            print(f"    {len(pending)} change(s) waiting for analysis")
         if w.why:
             print(f"    why: {w.why}")
+    if state.apply_queue:
+        print(f"  {len(state.apply_queue)} report(s) waiting for local branches")
     return 0
 
 
@@ -153,53 +165,158 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     report = run(cfg, _opts(args, analyze=False, update_state=False))
     for rr in report.repos:
         print(f"\n## {rr.repo} ({len(rr.items)} new since {rr.since.date().isoformat()})")
+        if rr.deferred:
+            print(f"  {rr.deferred} additional change(s) waiting")
         if rr.error:
             print(f"  error: {rr.error}")
         for it in rr.items:
             print(f"  {it.date.date().isoformat()}  {it.id:<22} {it.title[:90]}")
-    return 0
+    return int(any(rr.error for rr in report.repos))
+
+
+@contextmanager
+def _locked(cfg: Config):
+    path = cfg.resolve(cfg.state_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(path) + ".lock", timeout=0):
+        yield
+
+
+def _deliver(cfg: Config, explicit: Path | None = None) -> int:
+    path = cfg.resolve(cfg.state_file)
+    state = load_state(path)
+    failed = False
+    paths = [explicit.resolve()] if explicit else [cfg.resolve(p) for p in state.apply_queue]
+    for source in paths:
+        try:
+            report = RunReport.model_validate_json(source.read_bytes())
+            branches = apply_report(cfg.resolve(cfg.product.path), report)
+            for name in branches:
+                print(f"Local branch: {name}", file=sys.stderr)
+        except (BranchError, OSError, ValueError) as e:
+            print(f"Could not apply {source}: {e}", file=sys.stderr)
+            failed = True
+            continue
+        remaining = [p for p in state.apply_queue if cfg.resolve(p) != source]
+        if remaining != state.apply_queue:
+            state.apply_queue = remaining
+            save_state(state, path)
+    return int(failed)
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    cfg, _ = _load(args)
+    with _locked(cfg):
+        return _deliver(cfg, Path(args.report) if args.report else None)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     cfg, _ = _load(args)
-    report = run(cfg, _opts(args, update_state=not args.no_state))
-    md, js = write_reports(report, cfg.resolve(cfg.report.dir))
+    return _cycle(cfg, args, watching=False)
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    cfg, path = _load(args)
+    stop = threading.Event()
+    previous = signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    try:
+        while not stop.is_set():
+            try:
+                cfg, _ = load_config(path)
+                status = _cycle(cfg, args, watching=True)
+            except (OSError, ConfigError, BranchError, Timeout) as e:
+                print(f"Poll failed: {e}", file=sys.stderr)
+                status = 1
+            if args.once:
+                return status
+            delay = args.interval or cfg.workflow.interval_seconds
+            print(f"Next poll in {delay}s.", file=sys.stderr, flush=True)
+            stop.wait(delay)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    return 0
+
+
+def _cycle(cfg: Config, args: argparse.Namespace, watching: bool) -> int:
+    with _locked(cfg):
+        opts = _opts(args, update_state=not args.no_state, apply=args.apply, skip_empty_report=watching and not args.issue_always)
+        try:
+            report = run(cfg, opts)
+        finally:
+            delivery = _deliver(cfg) if opts.update_state else 0
+        if not opts.update_state:
+            for name in apply_report(cfg.resolve(cfg.product.path), report):
+                print(f"Local branch: {name}", file=sys.stderr)
+    if watching and not args.issue_always and not any(rr.items or rr.error for rr in report.repos):
+        return delivery
+    md, js = report_paths(report, cfg.resolve(cfg.report.dir))
     n_sugs = sum(len(r.result.suggestions) for r in report.repos if r.result)
-    n_items = sum(len(r.items) for r in report.repos)
     errors = [r for r in report.repos if r.error]
     print(f"\nReport: {md}\n        {js}", file=sys.stderr)
+    if output := os.environ.get("GITHUB_OUTPUT"):
+        with open(output, "a", encoding="utf-8") as stream:
+            for key, file in (("report_md", md), ("report_json", js)):
+                if "\n" in str(file) or "\r" in str(file):
+                    raise ConfigError("GitHub Actions output paths must fit on a single line.")
+                print(f"{key}={file}", file=stream)
     if args.stdout:
         print(md.read_text())
 
     if args.issue:
-        if n_sugs or errors or (args.issue_always and n_items):
-            repo = cfg.report.issue_repo or os.environ.get("GITHUB_REPOSITORY")
-            if not repo:
-                print("! --issue needs report.issue_repo in watchpo.yml or $GITHUB_REPOSITORY", file=sys.stderr)
+        if n_sugs or errors or args.issue_always:
+            if _publish(cfg, report):
                 return 1
-            title = f"watchpo: {n_sugs} suggestion(s) from {n_items} upstream change(s) ({report.started_at.date().isoformat()})"
-            gh = GitHub(resolve_token())
-            try:
-                url = gh.create_issue(repo, title, issue_body(report), cfg.report.issue_labels)
-                print(f"Issue: {url}", file=sys.stderr)
-            except GitHubError as e:
-                print(f"✗ {e}", file=sys.stderr)
-                return 1
-            finally:
-                gh.close()
         else:
             print("No suggestions; skipping issue (use --issue-always to open one anyway).", file=sys.stderr)
 
     attempted = [r for r in report.repos if r.items or r.error]
-    if attempted and all(r.error for r in attempted):
+    if errors and (watching or all(r.error for r in attempted)):
         return 1
+    return delivery
+
+
+def _publish(cfg: Config, report: RunReport) -> int:
+    repo = cfg.report.issue_repo or os.environ.get("GITHUB_REPOSITORY")
+    if not repo:
+        print("Set report.issue_repo or GITHUB_REPOSITORY for issue publication.", file=sys.stderr)
+        return 1
+    n_sugs = sum(len(r.result.suggestions) for r in report.repos if r.result)
+    n_items = sum(len(r.items) for r in report.repos)
+    title = f"watchpo: {n_sugs} suggestion(s) from {n_items} upstream change(s) ({report.started_at.date()})"
+    gh = GitHub(resolve_token())
+    try:
+        url = gh.create_issue(repo, title, issue_body(report), cfg.report.issue_labels)
+        print(f"Issue: {url}", file=sys.stderr)
+        return 0
+    except GitHubError as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 1
+    finally:
+        gh.close()
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    cfg, _ = _load(args)
+    return _publish(cfg, RunReport.model_validate_json(Path(args.report).read_bytes()))
+
+
+def cmd_path(args: argparse.Namespace) -> int:
+    cfg, _ = _load(args)
+    print(cfg.resolve(cfg.state_file if args.kind == "state" else cfg.report.dir))
     return 0
+
+
+def _interval(value: str) -> int:
+    seconds = int(value)
+    if seconds < 1:
+        raise argparse.ArgumentTypeError("interval must be at least one second")
+    return seconds
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="watchpo",
-        description="Track open-source repos and get Claude's suggestions for improving your product.",
+        description="Track upstream changes, analyze their impact, and prepare local product updates.",
     )
     p.add_argument("--version", action="version", version=f"watchpo {__version__}")
     p.add_argument("-c", "--config", help="path to watchpo.yml (default: search upward from cwd)")
@@ -228,18 +345,35 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("list", help="show watched repos")
     s.set_defaults(fn=cmd_list)
 
-    s = sub.add_parser("profile", help="print the product profile sent to Claude")
+    s = sub.add_parser("profile", help="print the product profile sent to the selected model")
     s.set_defaults(fn=cmd_profile)
 
+    s = sub.add_parser("apply", help="create local Git branches from queued edits or a saved JSON report")
+    s.add_argument("report", nargs="?", help="JSON report (defaults to the local apply queue)")
+    s.set_defaults(fn=cmd_apply)
+
+    s = sub.add_parser("publish", help="open a digest issue from a saved JSON report")
+    s.add_argument("report")
+    s.set_defaults(fn=cmd_publish)
+
+    s = sub.add_parser("path", help="print a configured output path")
+    s.add_argument("kind", choices=["state", "reports"])
+    s.set_defaults(fn=cmd_path)
+
     for name, fn, help_ in (
-        ("fetch", cmd_fetch, "list new upstream changes (no Claude calls, no state change)"),
+        ("fetch", cmd_fetch, "list new upstream changes (no model calls, no state change)"),
         ("run", cmd_run, "analyze new upstream changes and write a report"),
+        ("watch", cmd_watch, "continuously poll from this machine"),
     ):
         s = sub.add_parser(name, help=help_)
         s.add_argument("-r", "--repo", action="append", help="only this repo (repeatable)")
         s.add_argument("--since", help="window start instead of the last checkpoint: 7d, 48h, 2w, or 2026-11-01")
         s.add_argument("--rescan", action="store_true", help="include changes already analyzed in earlier runs")
-        if name == "run":
+        if name == "watch":
+            s.add_argument("--interval", type=_interval, metavar="SECONDS", help="override the poll interval")
+            s.add_argument("--once", action="store_true", help="run one poll and exit")
+        if name in ("run", "watch"):
+            s.add_argument("--apply", action="store_true", help="create local branches for concrete AI edits")
             s.add_argument("--issue", action="store_true", help="open a GitHub issue with the digest")
             s.add_argument("--issue-always", action="store_true", help="open an issue even with no suggestions")
             s.add_argument("--no-state", action="store_true", help="don't update checkpoints")
@@ -252,6 +386,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return args.fn(args)
+    except Timeout:
+        print("Another watchpo cycle is using this state file.", file=sys.stderr)
+        return 1
+    except (BranchError, OSError) as e:
+        print(f"✗ {e}", file=sys.stderr)
+        return 1
     except ConfigError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 2

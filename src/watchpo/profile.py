@@ -51,9 +51,7 @@ class Codebase:
     @cached_property
     def files(self) -> list[str]:
         files = self._git_files()
-        if files is None:
-            files = self._walk_files()
-        return sorted(f for f in files if not is_sensitive(f))
+        return sorted(f for f in files or [] if not is_sensitive(f))
 
     @cached_property
     def _file_set(self) -> set[str]:
@@ -72,17 +70,6 @@ class Codebase:
         paths = [p for p in out.stdout.decode("utf-8", "replace").split("\0") if p]
         return [p for p in paths if not (set(PurePosixPath(p).parts) & SKIP_DIRS)]
 
-    def _walk_files(self) -> list[str]:
-        out = []
-        for p in self.root.rglob("*"):
-            rel = p.relative_to(self.root)
-            if set(rel.parts) & SKIP_DIRS or not p.is_file():
-                continue
-            out.append(rel.as_posix())
-            if len(out) > 50_000:
-                break
-        return out
-
     def _safe_path(self, rel: str) -> Path | None:
         rel = rel.strip()
         if rel.startswith("./"):
@@ -90,16 +77,21 @@ class Codebase:
         if rel not in self._file_set:
             return None
         p = (self.root / rel).resolve()
-        if not p.is_relative_to(self.root) or not p.is_file():
+        if p != self.root / rel or not p.is_file():
             return None
         return p
 
     def read_text(self, rel: str) -> str | None:
-        p = self._safe_path(rel)
-        if p is None or p.stat().st_size > MAX_FILE_BYTES:
+        try:
+            p = self._safe_path(rel)
+            if p is None or p.stat().st_size > MAX_FILE_BYTES:
+                return None
+            with p.open("rb") as stream:
+                data = stream.read(MAX_FILE_BYTES + 1)
+        except (OSError, RuntimeError):
+            # A long-lived checkout can change between listing and opening a file.
             return None
-        data = p.read_bytes()
-        if b"\0" in data[:8192]:
+        if len(data) > MAX_FILE_BYTES or b"\0" in data[:8192]:
             return None
         return data.decode("utf-8", "replace")
 

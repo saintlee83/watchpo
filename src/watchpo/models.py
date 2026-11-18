@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Literal
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
@@ -46,6 +47,12 @@ Level = Literal["high", "medium", "low"]
 Effort = Literal["small", "medium", "large"]
 
 
+class Edit(BaseModel):
+    path: str
+    before: str = Field(min_length=1)
+    after: str
+
+
 class Suggestion(BaseModel):
     title: str
     category: Category
@@ -56,6 +63,7 @@ class Suggestion(BaseModel):
     why_it_matters: str
     recommendation: str
     affected_files: list[str] = Field(default_factory=list)
+    edits: list[Edit] = Field(default_factory=list)
     impact: Level
     effort: Effort
     confidence: Level
@@ -96,13 +104,18 @@ class RepoReport(BaseModel):
     items: list[ChangeItem] = Field(default_factory=list)
     result: AnalysisResult | None = None
     error: str | None = None
+    deferred: int = 0
     served_by: str | None = None  # model that produced the final answer
     usage: Usage = Field(default_factory=Usage)
 
 
 class RunReport(BaseModel):
+    run_id: UUID = Field(default_factory=uuid4)
     product: str
     started_at: datetime
     finished_at: datetime | None = None
     model: str
+    provider: str = "anthropic"
+    base_commit: str | None = None
+    product_subdir: str | None = None
     repos: list[RepoReport] = Field(default_factory=list)
